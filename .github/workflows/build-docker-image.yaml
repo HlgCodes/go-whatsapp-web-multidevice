@@ -32,10 +32,10 @@ jobs:
             suffix: arm
             runs-on: ubuntu-24.04-arm
             qemu: ""
-          - platform: linux/arm/v7
-            suffix: armv7
-            runs-on: ubuntu-24.04-arm
-            qemu: arm
+          # - platform: linux/arm/v7
+          #   suffix: armv7
+          #   runs-on: ubuntu-24.04-arm
+          #   qemu: arm
     runs-on: ${{ matrix.runs-on }}
     permissions:
       contents: read
@@ -85,8 +85,7 @@ jobs:
         run: |
           docker buildx imagetools create -t ${{ env.IMAGE_BASE }}:${{ env.TAG }} \
             ${{ env.IMAGE_BASE }}:${{ env.TAG }}-amd \
-            ${{ env.IMAGE_BASE }}:${{ env.TAG }}-arm \
-            ${{ env.IMAGE_BASE }}:${{ env.TAG }}-armv7
+            ${{ env.IMAGE_BASE }}:${{ env.TAG }}-arm
       - name: Create Latest Manifest
         run: |
           docker buildx imagetools create -t ${{ env.IMAGE_BASE }}:latest \
