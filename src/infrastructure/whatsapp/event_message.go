@@ -181,6 +181,13 @@ func buildFromFields(ctx context.Context, client *whatsmeow.Client, evt *events.
 	}
 	payload["chat_id"] = chatJID.String()
 
+	if utils.IsGroupJID(chatJID.String()) {
+		groupName := getGroupName(ctx, chatJID.String())
+		if groupName != "" {
+			payload["chat_name"] = groupName
+		}
+	}
+
 	senderJID := evt.Info.Sender
 	if senderJID.Server == "lid" {
 		payload["from_lid"] = senderJID.ToNonAD().String()
