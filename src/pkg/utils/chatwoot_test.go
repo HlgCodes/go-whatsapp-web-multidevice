@@ -141,6 +141,32 @@ func TestMatchesIgnoredJID(t *testing.T) {
 	}
 }
 
+func TestIsNewsletterJID(t *testing.T) {
+	// Newsletter (channel) JIDs like 120363144038483540@newsletter are
+	// broadcast feeds, not conversations. Their local part is an 18-digit
+	// channel id — not a phone number — so letting one reach the Chatwoot
+	// contact-creation phone path always fails with a 422 "Phone number
+	// should be in e164 format" (E.164 caps at 15 digits).
+	tests := []struct {
+		name string
+		jid  string
+		want bool
+	}{
+		{name: "newsletter JID", jid: "120363144038483540@newsletter", want: true},
+		{name: "ordinary user JID", jid: "628123456789@s.whatsapp.net", want: false},
+		{name: "group JID", jid: "120363123@g.us", want: false},
+		{name: "lid JID", jid: "abc123@lid", want: false},
+		{name: "empty string", jid: "", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsNewsletterJID(tt.jid); got != tt.want {
+				t.Fatalf("IsNewsletterJID(%q) = %v, want %v", tt.jid, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsSystemBroadcastJID(t *testing.T) {
 	// Pinning the exact strings prevents a future "match by suffix" rewrite
 	// from letting real-status-bearing JIDs (e.g. "status@s.whatsapp.net")
@@ -335,6 +361,76 @@ func TestWhatsAppToChatwootMarkdown(t *testing.T) {
 			name: "PreExistingSentinelStripped",
 			in:   "\x01*bold*\x02",
 			want: "**bold**",
+		},
+		{
+			// WhatsApp only formats at word boundaries, so URL query params
+			// and snake_case ids must come through as typed.
+			name: "URLWithUnderscoresUnchanged",
+			in:   "🔗 Track: https://acme.example/t?utm_source=wa&utm_medium=tpl",
+			want: "🔗 Track: https://acme.example/t?utm_source=wa&utm_medium=tpl",
+		},
+		{
+			// Links are never formatted, even where a path segment is
+			// wrapped in delimiters.
+			name: "LinkPathsUnchanged",
+			in:   "Docs: https://acme.example/_docs_/ and www.acme.example/~john/~doc~",
+			want: "Docs: https://acme.example/_docs_/ and www.acme.example/~john/~doc~",
+		},
+		{
+			name: "FormattingAroundLinks",
+			in:   "*https://acme.example* _see https://x.example/a_b_c now_",
+			want: "**https://acme.example** *see https://x.example/a_b_c now*",
+		},
+		{
+			// Punctuation after the closing delimiter is not part of the link.
+			name: "FormattedLinkBeforePunctuation",
+			in:   "Kunjungi *https://acme.id/promo*! (_www.acme.id/faq_), ~https://old.acme.id~;",
+			want: "Kunjungi **https://acme.id/promo**! (*www.acme.id/faq*), ~~https://old.acme.id~~;",
+		},
+		{
+			// A link starts with a letter, so it is no boundary for a pair.
+			name: "PairTouchingLinkUnchanged",
+			in:   "*Link:*https://acme.id _note_www.acme.id",
+			want: "*Link:*https://acme.id _note_www.acme.id",
+		},
+		{
+			name: "CapitalizedLinkPathsUnchanged",
+			in:   "Www.toko.id/_toko_ HTTPS://ACME.ID/_PROMO_",
+			want: "Www.toko.id/_toko_ HTTPS://ACME.ID/_PROMO_",
+		},
+		{
+			name: "SnakeCaseUnchanged",
+			in:   "Selected option opt_book_now [review_and_pay]",
+			want: "Selected option opt_book_now [review_and_pay]",
+		},
+		{
+			name: "MidWordDelimitersUnchanged",
+			in:   "2*3*4 and a~b~c",
+			want: "2*3*4 and a~b~c",
+		},
+		{
+			// Adjacent pairs share the boundary character between them.
+			name: "AdjacentPairs",
+			in:   "*a* *b* _c_ _d_ ~e~ ~f~",
+			want: "**a** **b** *c* *d* ~~e~~ ~~f~~",
+		},
+		{
+			// Passes are capped at two: an unbounded loop unwraps one nesting
+			// level per pass, so a crafted 64KB message burned ~50s of CPU.
+			name: "NestingBeyondTwoPassesStops",
+			in:   "*a *b *c* d* e*",
+			want: "*a **b **c** d** e*",
+		},
+		{
+			// A doubled delimiter is not a WhatsApp pair; leave it as typed.
+			name: "DoubledDelimitersUnchanged",
+			in:   "**x** ~~y~~ __init__",
+			want: "**x** ~~y~~ __init__",
+		},
+		{
+			name: "PunctuationBoundaries",
+			in:   "(*Order #42*), _today_!",
+			want: "(**Order #42**), *today*!",
 		},
 	}
 

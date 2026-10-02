@@ -3,6 +3,7 @@ package validations
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -81,9 +82,12 @@ func ValidateSendMessage(ctx context.Context, request domainSend.MessageRequest)
 		return err
 	}
 
-	// Validate mentions if provided
-	for _, mention := range request.Mentions {
-		// Skip validation for special @everyone keyword
+	return validateMentions(request.Mentions)
+}
+
+// validateMentions checks explicit (ghost) mentions; "@everyone" is a keyword, not a phone.
+func validateMentions(mentions []string) error {
+	for _, mention := range mentions {
 		if mention == "@everyone" {
 			continue
 		}
@@ -91,7 +95,6 @@ func ValidateSendMessage(ctx context.Context, request domainSend.MessageRequest)
 			return pkgError.ValidationError(fmt.Sprintf("mention %s: phone number must be in international format", mention))
 		}
 	}
-
 	return nil
 }
 
@@ -141,7 +144,7 @@ func ValidateSendImage(ctx context.Context, request domainSend.ImageRequest) err
 		return err
 	}
 
-	return nil
+	return validateMentions(request.Mentions)
 }
 
 func ValidateSendSticker(ctx context.Context, request domainSend.StickerRequest) error {
@@ -238,7 +241,7 @@ func ValidateSendFile(ctx context.Context, request domainSend.FileRequest) error
 		return err
 	}
 
-	return nil
+	return validateMentions(request.Mentions)
 }
 
 func ValidateSendVideo(ctx context.Context, request domainSend.VideoRequest) error {
@@ -295,7 +298,7 @@ func ValidateSendVideo(ctx context.Context, request domainSend.VideoRequest) err
 		return err
 	}
 
-	return nil
+	return validateMentions(request.Mentions)
 }
 
 func ValidateSendContact(ctx context.Context, request domainSend.ContactRequest) error {
@@ -452,6 +455,9 @@ func ValidateSendPoll(ctx context.Context, request domainSend.PollRequest) error
 	if len(request.Options) == 0 {
 		return pkgError.ValidationError("options: cannot be blank.")
 	}
+	if request.MaxAnswer > 0 && uint64(request.MaxAnswer) > uint64(math.MaxUint32) {
+		return pkgError.ValidationError(fmt.Sprintf("max_answer: must be no greater than %d.", uint64(math.MaxUint32)))
+	}
 
 	err := validation.ValidateStructWithContext(ctx, &request,
 		validation.Field(&request.Phone, validation.Required),
@@ -513,6 +519,27 @@ func ValidateSendChatPresence(ctx context.Context, request domainSend.ChatPresen
 
 	// Custom validation for phone number format
 	if err := validatePhoneNumber(request.Phone); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func ValidateForwardMessage(ctx context.Context, request domainSend.ForwardRequest) error {
+	err := validation.ValidateStructWithContext(ctx, &request,
+		validation.Field(&request.MessageID, validation.Required),
+		validation.Field(&request.Phone, validation.Required),
+	)
+
+	if err != nil {
+		return pkgError.ValidationError(err.Error())
+	}
+
+	if err := validatePhoneNumber(request.Phone); err != nil {
+		return err
+	}
+
+	if err := validateDuration(request.Duration); err != nil {
 		return err
 	}
 

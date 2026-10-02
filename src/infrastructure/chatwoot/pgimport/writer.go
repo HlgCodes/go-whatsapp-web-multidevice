@@ -376,7 +376,7 @@ func (i *Importer) findOrCreateConversation(
 			 last_activity_at, waiting_since, created_at, updated_at)
 		VALUES
 			($1, $2, $3, $4, $5,
-			 gen_random_uuid()::text,
+			 gen_random_uuid(),
 			 '{}'::jsonb, '{}'::jsonb,
 			 $6, $6, $6, now())
 		RETURNING id
@@ -557,6 +557,11 @@ func (i *Importer) buildMessageLink(msg *domainChatStorage.Message, convID, chat
 		SourceID:                     sourceID,
 		Direction:                    direction,
 		IsRead:                       false,
+		// Account scope must be stamped here: pgimport is legacy-only (config id
+		// stays 0) but a zero account id would only match through the legacy-zero
+		// wildcard, which per-device mode disables — and the boot-time backfill
+		// only repairs rows existing at startup.
+		ChatwootAccountID: i.accountID,
 	}
 }
 

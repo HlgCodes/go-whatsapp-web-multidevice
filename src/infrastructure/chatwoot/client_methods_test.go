@@ -48,23 +48,34 @@ func TestNewClient_TrimsTrailingSlashAndMapsConfig(t *testing.T) {
 	}()
 
 	tests := []struct {
-		name    string
-		url     string
-		wantURL string
+		name      string
+		url       string
+		token     string
+		wantURL   string
+		wantToken string
 	}{
 		// The trailing slash matters: endpoints are built with
 		// fmt.Sprintf("%s/api/v1/...") so a stray slash would yield a
 		// double-slash path. TrimRight removes any run of trailing slashes.
-		{"single trailing slash", "https://chatwoot.example.com/", "https://chatwoot.example.com"},
-		{"multiple trailing slashes", "https://chatwoot.example.com///", "https://chatwoot.example.com"},
-		{"no trailing slash", "https://chatwoot.example.com", "https://chatwoot.example.com"},
-		{"empty url stays empty", "", ""},
+		{"single trailing slash", "https://chatwoot.example.com/", "tok-123", "https://chatwoot.example.com", "tok-123"},
+		{"multiple trailing slashes", "https://chatwoot.example.com///", "tok-123", "https://chatwoot.example.com", "tok-123"},
+		{"no trailing slash", "https://chatwoot.example.com", "tok-123", "https://chatwoot.example.com", "tok-123"},
+		{"empty url stays empty", "", "tok-123", "", "tok-123"},
+		// Tokens/URLs from Docker secret files, .env lines, or shell heredocs
+		// commonly carry surrounding whitespace or a trailing newline. An
+		// untrimmed token yields a malformed "api_access_token" header and a
+		// 401 from Chatwoot (issue #674); a newline on the URL survives the
+		// slash trim and corrupts every endpoint. Both must be trimmed.
+		{"token with trailing newline", "https://chatwoot.example.com", "tok-123\n", "https://chatwoot.example.com", "tok-123"},
+		{"token with surrounding spaces", "https://chatwoot.example.com", "  tok-123  ", "https://chatwoot.example.com", "tok-123"},
+		{"url with trailing newline before slash", "https://chatwoot.example.com/\n", "tok-123", "https://chatwoot.example.com", "tok-123"},
+		{"url with surrounding whitespace", "  https://chatwoot.example.com/  ", "tok-123", "https://chatwoot.example.com", "tok-123"},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			config.ChatwootURL = tc.url
-			config.ChatwootAPIToken = "tok-123"
+			config.ChatwootAPIToken = tc.token
 			config.ChatwootAccountID = 7
 			config.ChatwootInboxID = 9
 
@@ -73,8 +84,8 @@ func TestNewClient_TrimsTrailingSlashAndMapsConfig(t *testing.T) {
 			if c.BaseURL != tc.wantURL {
 				t.Errorf("BaseURL = %q, want %q", c.BaseURL, tc.wantURL)
 			}
-			if c.APIToken != "tok-123" {
-				t.Errorf("APIToken = %q, want tok-123", c.APIToken)
+			if c.APIToken != tc.wantToken {
+				t.Errorf("APIToken = %q, want %q", c.APIToken, tc.wantToken)
 			}
 			if c.AccountID != 7 {
 				t.Errorf("AccountID = %d, want 7", c.AccountID)
@@ -524,33 +535,20 @@ func TestUpdateContactName(t *testing.T) {
 	}
 }
 
-// --- FindConversation ------------------------------------------------------
+// --- selectOpenConversation ------------------------------------------------
 
-func TestFindConversation_ReturnsFirstOpenMatchingInbox(t *testing.T) {
+func TestSelectOpenConversation_ReturnsFirstOpenMatchingInbox(t *testing.T) {
 	// The first conversation that is both in this client's inbox AND not
 	// resolved wins. Earlier entries that fail either condition are skipped:
 	// a resolved conversation in the right inbox, and an open conversation
 	// in a different inbox, both come before the valid one.
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/api/v1/accounts/1/contacts/7/conversations" {
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
-		}
-		writeJSON(t, w, http.StatusOK, map[string]any{
-			"payload": []map[string]any{
-				{"id": 10, "inbox_id": 2, "status": "resolved"}, // right inbox, resolved -> skip
-				{"id": 11, "inbox_id": 99, "status": "open"},    // wrong inbox -> skip
-				{"id": 12, "inbox_id": 2, "status": "open"},     // match
-				{"id": 13, "inbox_id": 2, "status": "pending"},  // also valid but later
-			},
-		})
-	}))
-	defer server.Close()
-
-	c := newTestClient(t, server.URL)
-	conv, err := c.FindConversation(7)
-	if err != nil {
-		t.Fatalf("FindConversation: %v", err)
+	items := []conversationListItem{
+		{ID: 10, InboxID: 2, Status: "resolved"}, // right inbox, resolved -> skip
+		{ID: 11, InboxID: 99, Status: "open"},    // wrong inbox -> skip
+		{ID: 12, InboxID: 2, Status: "open"},     // match
+		{ID: 13, InboxID: 2, Status: "pending"},  // also valid but later
 	}
+	conv := selectOpenConversation(items, 2, 7)
 	if conv == nil || conv.ID != 12 {
 		t.Fatalf("conv = %+v, want ID 12", conv)
 	}
@@ -562,67 +560,27 @@ func TestFindConversation_ReturnsFirstOpenMatchingInbox(t *testing.T) {
 	}
 }
 
-func TestFindConversation_NonResolvedNonResolvedStatuses(t *testing.T) {
+func TestSelectOpenConversation_AcceptsNonResolvedStatuses(t *testing.T) {
 	// "resolved" is the only excluded status; any other status (here
 	// "pending") for the right inbox is considered an active conversation.
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(t, w, http.StatusOK, map[string]any{
-			"payload": []map[string]any{
-				{"id": 20, "inbox_id": 2, "status": "pending"},
-			},
-		})
-	}))
-	defer server.Close()
-
-	c := newTestClient(t, server.URL)
-	conv, err := c.FindConversation(7)
-	if err != nil {
-		t.Fatalf("FindConversation: %v", err)
+	items := []conversationListItem{
+		{ID: 20, InboxID: 2, Status: "pending"},
 	}
+	conv := selectOpenConversation(items, 2, 7)
 	if conv == nil || conv.ID != 20 {
 		t.Fatalf("conv = %+v, want ID 20", conv)
 	}
 }
 
-func TestFindConversation_NoneMatch(t *testing.T) {
-	// All candidates are either resolved or in the wrong inbox -> nil, nil.
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(t, w, http.StatusOK, map[string]any{
-			"payload": []map[string]any{
-				{"id": 30, "inbox_id": 2, "status": "resolved"},
-				{"id": 31, "inbox_id": 99, "status": "open"},
-			},
-		})
-	}))
-	defer server.Close()
-
-	c := newTestClient(t, server.URL)
-	conv, err := c.FindConversation(7)
-	if err != nil {
-		t.Fatalf("FindConversation: %v", err)
+func TestSelectOpenConversation_NoneMatch(t *testing.T) {
+	// All candidates are either resolved or in the wrong inbox -> nil.
+	items := []conversationListItem{
+		{ID: 30, InboxID: 2, Status: "resolved"},
+		{ID: 31, InboxID: 99, Status: "open"},
 	}
+	conv := selectOpenConversation(items, 2, 7)
 	if conv != nil {
 		t.Fatalf("conv = %+v, want nil", conv)
-	}
-}
-
-func TestFindConversation_Non200(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(t, w, http.StatusBadGateway, map[string]any{"error": "down"})
-	}))
-	defer server.Close()
-
-	c := newTestClient(t, server.URL)
-	conv, err := c.FindConversation(7)
-	if conv != nil {
-		t.Fatalf("conv = %+v, want nil", conv)
-	}
-	var httpErr *HTTPStatusError
-	if !errors.As(err, &httpErr) {
-		t.Fatalf("err = %v, want *HTTPStatusError", err)
-	}
-	if httpErr.StatusCode != http.StatusBadGateway || httpErr.Op != "list contact conversations" {
-		t.Errorf("err = %+v, want 502 'list contact conversations'", httpErr)
 	}
 }
 
@@ -729,7 +687,7 @@ func TestCreateConversation_ZeroID(t *testing.T) {
 // --- FindOrCreateConversation ---------------------------------------------
 
 func TestFindOrCreateConversation_ReturnsFoundWithoutCreating(t *testing.T) {
-	// When FindConversation returns an existing conversation, no POST is made.
+	// When an open conversation already exists, no POST is made.
 	createCalls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -760,8 +718,7 @@ func TestFindOrCreateConversation_ReturnsFoundWithoutCreating(t *testing.T) {
 }
 
 func TestFindOrCreateConversation_CreatesWhenNotFound(t *testing.T) {
-	// FindConversation returns (nil, nil) -> the method falls through to
-	// CreateConversation.
+	// No open conversation -> the method falls through to CreateConversation.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet:
@@ -785,8 +742,8 @@ func TestFindOrCreateConversation_CreatesWhenNotFound(t *testing.T) {
 }
 
 func TestFindOrCreateConversation_SwallowsFindErrorThenCreates(t *testing.T) {
-	// FindConversation failing is logged but NOT propagated: the method still
-	// proceeds to create. This codifies the current swallow-and-create
+	// Listing conversations failing is logged but NOT propagated: the method
+	// still proceeds to create. This codifies the current swallow-and-create
 	// behavior — a find error must not block conversation creation.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -999,6 +956,10 @@ func TestUpdateLastSeen_UsesInboxIdentifierAndContactSource(t *testing.T) {
 		case "/public/api/v1/inboxes/api-inbox-token/contacts/628123456789@s.whatsapp.net/conversations/5/update_last_seen":
 			if r.Method != http.MethodPost {
 				t.Fatalf("update_last_seen method = %s", r.Method)
+			}
+			const wantRequestURI = "/public/api/v1/inboxes/api-inbox-token/contacts/628123456789%40s%2Ewhatsapp%2Enet/conversations/5/update_last_seen"
+			if r.RequestURI != wantRequestURI {
+				t.Fatalf("update_last_seen request URI = %s, want %s", r.RequestURI, wantRequestURI)
 			}
 			sawUpdate = true
 			w.WriteHeader(http.StatusOK)
@@ -1214,12 +1175,13 @@ func TestCreateMessage_AttachmentMissingIDReturnsZero(t *testing.T) {
 // --- Echo dedup map (MarkMessageAsSent / IsMessageSentByUs) ----------------
 
 func TestEchoDedup_MapBehavior(t *testing.T) {
-	// MarkMessageAsSent(0) is a no-op and IsMessageSentByUs(0) is always
+	const acc = 1
+	// MarkMessageAsSent(_, 0) is a no-op and IsMessageSentByUs(_, 0) is always
 	// false: id 0 is the "no id" sentinel returned by CreateMessage and must
 	// never be treated as a tracked message.
-	MarkMessageAsSent(0)
-	if IsMessageSentByUs(0) {
-		t.Error("IsMessageSentByUs(0) = true, want false")
+	MarkMessageAsSent(acc, 0)
+	if IsMessageSentByUs(acc, 0) {
+		t.Error("IsMessageSentByUs(acc, 0) = true, want false")
 	}
 
 	// A real id, once marked, is recognized as ours. We use a large, fixed
@@ -1228,19 +1190,36 @@ func TestEchoDedup_MapBehavior(t *testing.T) {
 	// does not delete on read, so it stays true on a second check — Chatwoot
 	// fires multiple webhook events for one message.
 	const id = 987654321
-	if IsMessageSentByUs(id) {
+	if IsMessageSentByUs(acc, id) {
 		t.Fatalf("IsMessageSentByUs(%d) = true before marking, want false", id)
 	}
-	MarkMessageAsSent(id)
-	if !IsMessageSentByUs(id) {
+	MarkMessageAsSent(acc, id)
+	if !IsMessageSentByUs(acc, id) {
 		t.Fatalf("IsMessageSentByUs(%d) = false after marking, want true", id)
 	}
-	if !IsMessageSentByUs(id) {
+	if !IsMessageSentByUs(acc, id) {
 		t.Fatalf("IsMessageSentByUs(%d) = false on second check, want true (no delete-on-read)", id)
 	}
 
 	// An id that was never marked is not ours.
-	if IsMessageSentByUs(123456789) {
+	if IsMessageSentByUs(acc, 123456789) {
 		t.Error("IsMessageSentByUs(unknown) = true, want false")
+	}
+}
+
+// TestEchoDedup_AccountPartitioned guards multi-account routing: the same
+// numeric Chatwoot message id in two different accounts must not collide, or a
+// message we sent in account A would suppress a genuine agent reply with the
+// same id in account B (dropped reply).
+func TestEchoDedup_AccountPartitioned(t *testing.T) {
+	const id = 555111222
+	const accA, accB = 11, 22
+
+	MarkMessageAsSent(accA, id)
+	if !IsMessageSentByUs(accA, id) {
+		t.Fatalf("account A id %d should be ours after marking", id)
+	}
+	if IsMessageSentByUs(accB, id) {
+		t.Fatalf("account B id %d must NOT be considered ours (cross-account collision)", id)
 	}
 }

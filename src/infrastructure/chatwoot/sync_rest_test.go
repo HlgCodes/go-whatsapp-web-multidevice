@@ -27,7 +27,9 @@ func TestPgImporterForSync_EmptyURIReturnsNil(t *testing.T) {
 	orig := config.ChatwootImportDBURI
 	defer func() { config.ChatwootImportDBURI = orig }()
 
+	// allowPgImport=true exercises the URI branch (the gate is tested separately).
 	s := NewSyncService(nil, nil)
+	s.allowPgImport = true
 
 	tests := []struct {
 		name string
@@ -70,6 +72,7 @@ func TestPgImporterForSync_ConfiguredURIRequiresAccountAndInbox(t *testing.T) {
 	config.ChatwootInboxID = 99
 
 	s := NewSyncService(nil, nil)
+	s.allowPgImport = true // legacy/env service: direct-Postgres import enabled
 	imp, err := s.pgImporterForSync(context.Background())
 	if err == nil {
 		t.Fatal("pgImporterForSync() error = nil, want configured import failure")
@@ -94,12 +97,17 @@ func TestHasDownloadableChatwootMedia(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "media with direct path and key",
+			msg:  &domainChatStorage.Message{MediaType: "image", DirectPath: "/v/t62.7118-24/file.enc?ccb=11-4", MediaKey: []byte("key")},
+			want: true,
+		},
+		{
 			name: "text message",
 			msg:  &domainChatStorage.Message{Content: "hello"},
 			want: false,
 		},
 		{
-			name: "media without url",
+			name: "media without url or direct path",
 			msg:  &domainChatStorage.Message{MediaType: "image", MediaKey: []byte("key")},
 			want: false,
 		},

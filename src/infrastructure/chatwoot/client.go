@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/textproto"
 	"net/url"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
@@ -58,6 +60,11 @@ func Retryable(err error) bool {
 	if err == nil {
 		return false
 	}
+	// A nil registry is a wiring/startup condition, not transient: surface it
+	// loudly rather than enqueuing retries that would only fail the same way.
+	if errors.Is(err, ErrClientRegistryUnavailable) {
+		return false
+	}
 	var httpErr *HTTPStatusError
 	if errors.As(err, &httpErr) {
 		return httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= 500
@@ -86,24 +93,34 @@ func GetDefaultClient() *Client {
 	return defaultClient
 }
 
-func MarkMessageAsSent(messageID int) {
+// echoKey partitions the echo-dedup cache by Chatwoot account so the same
+// numeric message id in two different accounts cannot collide. Without this, a
+// message we sent in account A could suppress a genuine agent reply that
+// happens to have the same id in account B (the reply would be dropped).
+type echoKey struct {
+	AccountID int
+	MessageID int
+}
+
+func MarkMessageAsSent(accountID, messageID int) {
 	if messageID == 0 {
 		return
 	}
-	sentMessageIDs.Store(messageID, time.Now())
+	sentMessageIDs.Store(echoKey{AccountID: accountID, MessageID: messageID}, time.Now())
 }
 
-func IsMessageSentByUs(messageID int) bool {
+func IsMessageSentByUs(accountID, messageID int) bool {
 	if messageID == 0 {
 		return false
 	}
-	val, ok := sentMessageIDs.Load(messageID)
+	key := echoKey{AccountID: accountID, MessageID: messageID}
+	val, ok := sentMessageIDs.Load(key)
 	if !ok {
 		return false
 	}
 	storedAt := val.(time.Time)
 	if time.Since(storedAt) > sentMessageIDsTTL {
-		sentMessageIDs.Delete(messageID)
+		sentMessageIDs.Delete(key)
 		return false
 	}
 	// Don't delete on check — Chatwoot may fire multiple webhook events
@@ -127,16 +144,64 @@ func init() {
 	}()
 }
 
+// NewClient builds the Chatwoot client from the global CHATWOOT_* env config.
+// It is used for the legacy/env "single config" mode (no per-device config rows).
+// The env client is operator-trusted and may legitimately point at an internal
+// Chatwoot (e.g. the same Docker network), so it is NOT SSRF-guarded.
 func NewClient() *Client {
+	return newChatwootClient(config.ChatwootURL, config.ChatwootAPIToken, config.ChatwootAccountID, config.ChatwootInboxID, false)
+}
+
+// NewClientFromConfig builds a Chatwoot client for a specific (per-device)
+// destination from an operator-supplied config. The base URL is canonicalized
+// (a stored, already-validated URL falls back to a trimmed value on error). The
+// HTTP client is SSRF-guarded at connect time unless an explicit host allowlist
+// is configured (CHATWOOT_ALLOWED_HOSTS), which is the operator's opt-in to
+// trust specific hosts — including internal ones.
+func NewClientFromConfig(baseURL, apiToken string, accountID, inboxID int) *Client {
+	return newChatwootClient(baseURL, apiToken, accountID, inboxID, len(config.ChatwootAllowedHosts) == 0)
+}
+
+func newChatwootClient(baseURL, apiToken string, accountID, inboxID int, ssrfGuard bool) *Client {
+	canonical, err := CanonicalizeChatwootURL(baseURL)
+	if err != nil {
+		canonical = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	}
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	if ssrfGuard {
+		httpClient.Transport = ssrfGuardedTransport()
+	}
 	return &Client{
-		BaseURL:   strings.TrimRight(config.ChatwootURL, "/"),
-		APIToken:  config.ChatwootAPIToken,
-		AccountID: config.ChatwootAccountID,
-		InboxID:   config.ChatwootInboxID,
-		HTTPClient: &http.Client{
-			Timeout: 30 * time.Second,
+		BaseURL:    canonical,
+		APIToken:   strings.TrimSpace(apiToken),
+		AccountID:  accountID,
+		InboxID:    inboxID,
+		HTTPClient: httpClient,
+	}
+}
+
+// ssrfGuardedTransport returns an HTTP transport whose dialer rejects, at
+// connect time, any connection to a loopback/private/link-local/metadata
+// address. Checking post-resolution (via Dialer.Control) closes the DNS
+// rebinding window left open by validating the URL's host once up front.
+func ssrfGuardedTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control: func(_, address string, _ syscall.RawConn) error {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				host = address
+			}
+			if ip := net.ParseIP(host); ip != nil && isDisallowedSSRFIP(ip) {
+				return fmt.Errorf("chatwoot: blocked connection to disallowed address %s", address)
+			}
+			return nil
 		},
 	}
+	t.DialContext = dialer.DialContext
+	return t
 }
 
 func (c *Client) IsConfigured() bool {
@@ -357,9 +422,8 @@ type conversationListItem struct {
 }
 
 // listContactConversations fetches all conversations for a contact via the
-// contact-specific endpoint. Shared by FindConversation (which wants the
-// active one) and FindLatestConversation (which wants the most recent one to
-// reopen).
+// contact-specific endpoint. Used by FindOrCreateConversation to pick an open
+// conversation or the latest one for reopen.
 func (c *Client) listContactConversations(contactID int) ([]conversationListItem, error) {
 	endpoint := fmt.Sprintf("%s/api/v1/accounts/%d/contacts/%d/conversations", c.BaseURL, c.AccountID, contactID)
 	req, err := http.NewRequest("GET", endpoint, nil)
@@ -412,26 +476,6 @@ func selectLatestConversation(items []conversationListItem, inboxID, contactID i
 		}
 	}
 	return latest
-}
-
-func (c *Client) FindConversation(contactID int) (*Conversation, error) {
-	items, err := c.listContactConversations(contactID)
-	if err != nil {
-		return nil, err
-	}
-	return selectOpenConversation(items, c.InboxID, contactID), nil
-}
-
-// FindLatestConversation returns the most recent conversation for the contact
-// in this client's inbox, regardless of status. The reopen path uses it to
-// resurrect a resolved conversation instead of opening a new thread. Returns
-// (nil, nil) when the contact has no conversation in this inbox.
-func (c *Client) FindLatestConversation(contactID int) (*Conversation, error) {
-	items, err := c.listContactConversations(contactID)
-	if err != nil {
-		return nil, err
-	}
-	return selectLatestConversation(items, c.InboxID, contactID), nil
 }
 
 // ToggleConversationStatus sets a conversation's status (open/resolved/pending)
@@ -754,8 +798,8 @@ func (c *Client) UpdateLastSeen(conversationID int, contactInboxSourceID string)
 	endpoint := fmt.Sprintf(
 		"%s/public/api/v1/inboxes/%s/contacts/%s/conversations/%d/update_last_seen",
 		c.BaseURL,
-		url.PathEscape(inboxIdentifier),
-		url.PathEscape(contactInboxSourceID),
+		escapeChatwootPathSegment(inboxIdentifier),
+		escapeChatwootPathSegment(contactInboxSourceID),
 		conversationID,
 	)
 	req, err := http.NewRequest(http.MethodPost, endpoint, nil)
@@ -775,6 +819,32 @@ func (c *Client) UpdateLastSeen(conversationID int, contactInboxSourceID string)
 		return &HTTPStatusError{StatusCode: resp.StatusCode, Op: "update last seen", Body: string(body)}
 	}
 	return nil
+}
+
+// escapeChatwootPathSegment percent-encodes a value for use as a single path
+// segment of Chatwoot's public API.
+//
+// url.PathEscape is not sufficient here. Per RFC 3986 both "@" and "." are legal
+// in a path segment, so PathEscape leaves them untouched -- but Chatwoot's Rails
+// router does not match them raw in this position: a trailing ".net" is read as a
+// format suffix, and the segment fails to resolve. The contact identifier is a
+// WhatsApp JID (e.g. "5511999999999@s.whatsapp.net"), so it hits both cases and
+// every call 404s with an HTML error page rather than a JSON error, which makes
+// the failure easy to misread as a routing or proxy problem.
+//
+// Verified against Chatwoot: only the fully-escaped form resolves.
+//
+//	.../contacts/5511999999999@s.whatsapp.net        -> 404
+//	.../contacts/5511999999999@s.whatsapp%2Enet      -> 404
+//	.../contacts/5511999999999%40s%2Ewhatsapp%2Enet  -> 200
+//
+// PathEscape runs first so that "%" is encoded before the additional characters
+// are substituted, which keeps the result from being double-encoded.
+func escapeChatwootPathSegment(s string) string {
+	s = url.PathEscape(s)
+	s = strings.ReplaceAll(s, "@", "%40")
+	s = strings.ReplaceAll(s, ".", "%2E")
+	return s
 }
 
 func (c *Client) createMessageWithAttachments(endpoint, content, messageType string, attachments []string, opt MessageOptions) (int, error) {
@@ -822,9 +892,14 @@ func (c *Client) createMessageWithAttachments(endpoint, content, messageType str
 
 		mimeType := mime.TypeByExtension(ext)
 		if mimeType == "" {
-			if ext == ".oga" {
+			switch ext {
+			case ".oga", ".ogg":
+				// The runtime image ships no /etc/mime.types, so
+				// mime.TypeByExtension never resolves these on its own.
+				// WhatsApp voice notes are saved as .ogg (Opus-in-Ogg);
+				// .oga is the alternate extension for the same container.
 				mimeType = "audio/ogg"
-			} else {
+			default:
 				mimeType = "application/octet-stream"
 			}
 		}

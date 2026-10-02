@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"database/sql"
-	"embed"
 	"fmt"
 	"os"
 	"strings"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
 	domainApp "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/app"
+	domainCall "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/call"
 	domainChat "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chat"
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	domainDevice "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/device"
@@ -34,9 +34,6 @@ import (
 )
 
 var (
-	EmbedIndex embed.FS
-	EmbedViews embed.FS
-
 	// Whatsapp
 	whatsappCli *whatsmeow.Client
 
@@ -46,13 +43,16 @@ var (
 
 	// Usecase
 	appUsecase        domainApp.IAppUsecase
+	callUsecase       domainCall.ICallUsecase
 	chatUsecase       domainChat.IChatUsecase
 	sendUsecase       domainSend.ISendUsecase
+	scheduleUsecase   domainSend.IScheduleUsecase
 	userUsecase       domainUser.IUserUsecase
 	messageUsecase    domainMessage.IMessageUsecase
 	groupUsecase      domainGroup.IGroupUsecase
 	newsletterUsecase domainNewsletter.INewsletterUsecase
 	deviceUsecase     domainDevice.IDeviceUsecase
+	scheduleStop      func()
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -104,6 +104,40 @@ func initEnvConfig() {
 		proxies := strings.Split(envTrustedProxies, ",")
 		config.AppTrustedProxies = proxies
 	}
+	if envCORSOrigins := viper.GetString("app_cors_allowed_origins"); envCORSOrigins != "" {
+		config.AppCORSAllowedOrigins = strings.Split(envCORSOrigins, ",")
+	}
+
+	// Web UI settings. Guarded on GetString != "" so an unset key keeps the
+	// default instead of being overwritten by the zero value of GetBool /
+	// GetDuration. viper.IsSet works equally well here (it does consult
+	// AutomaticEnv), so either guard is fine for new keys.
+	if viper.GetString("app_ui_enabled") != "" {
+		config.AppUIEnabled = viper.GetBool("app_ui_enabled")
+	}
+	if viper.GetString("mcp_enabled") != "" {
+		config.McpEnabled = viper.GetBool("mcp_enabled")
+	}
+	if viper.GetString("app_ui_auto_update") != "" {
+		config.AppUIAutoUpdate = viper.GetBool("app_ui_auto_update")
+	}
+	if envUIRepo := viper.GetString("app_ui_repo"); envUIRepo != "" {
+		config.AppUIRepo = envUIRepo
+	}
+	if envUIAsset := viper.GetString("app_ui_asset_name"); envUIAsset != "" {
+		config.AppUIAssetName = envUIAsset
+	}
+	if viper.GetString("app_ui_update_interval") != "" {
+		if interval := viper.GetDuration("app_ui_update_interval"); interval > 0 {
+			config.AppUIUpdateInterval = interval
+		}
+	}
+	if envUIToken := viper.GetString("app_ui_github_token"); envUIToken != "" {
+		config.AppUIGithubToken = envUIToken
+	}
+	if envUIPin := viper.GetString("app_ui_asset_sha256"); envUIPin != "" {
+		config.AppUIAssetSHA256 = envUIPin
+	}
 
 	// Database settings
 	if envDBURI := viper.GetString("db_uri"); envDBURI != "" {
@@ -111,6 +145,11 @@ func initEnvConfig() {
 	}
 	if envDBKEYSURI := viper.GetString("db_keys_uri"); envDBKEYSURI != "" {
 		config.DBKeysURI = envDBKEYSURI
+	}
+	if viper.IsSet("chat_storage_max_open_conns") {
+		if n := viper.GetInt("chat_storage_max_open_conns"); n > 0 {
+			config.ChatStorageMaxOpenConns = n
+		}
 	}
 
 	// WhatsApp settings
@@ -122,6 +161,9 @@ func initEnvConfig() {
 	}
 	if viper.IsSet("whatsapp_auto_download_media") {
 		config.WhatsappAutoDownloadMedia = viper.GetBool("whatsapp_auto_download_media")
+	}
+	if viper.IsSet("whatsapp_ignore_status_media") {
+		config.WhatsappIgnoreStatusMedia = viper.GetBool("whatsapp_ignore_status_media")
 	}
 	if envWebhook := viper.GetString("whatsapp_webhook"); envWebhook != "" {
 		webhook := strings.Split(envWebhook, ",")
@@ -137,6 +179,19 @@ func initEnvConfig() {
 		events := strings.Split(envWebhookEvents, ",")
 		config.WhatsappWebhookEvents = events
 	}
+	if envWebhookIgnoreJids := viper.GetString("whatsapp_webhook_ignore_jids"); envWebhookIgnoreJids != "" {
+		parts := strings.Split(envWebhookIgnoreJids, ",")
+		jids := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if trimmed := strings.TrimSpace(p); trimmed != "" {
+				jids = append(jids, trimmed)
+			}
+		}
+		config.WhatsappWebhookIgnoreJids = jids
+	}
+	if viper.IsSet("whatsapp_webhook_device_merge_global") {
+		config.WhatsappWebhookDeviceMergeGlobal = viper.GetBool("whatsapp_webhook_device_merge_global")
+	}
 	if viper.IsSet("whatsapp_account_validation") {
 		config.WhatsappAccountValidation = viper.GetBool("whatsapp_account_validation")
 	}
@@ -145,6 +200,12 @@ func initEnvConfig() {
 	}
 	if envPresenceOnConnect := viper.GetString("whatsapp_presence_on_connect"); envPresenceOnConnect != "" {
 		config.WhatsappPresenceOnConnect = envPresenceOnConnect
+	}
+	// Outbound proxy for whatsmeow WebSocket. Standard HTTP_PROXY env does not
+	// apply to the underlying ws dialer; this binding plumbs the address into
+	// (*whatsmeow.Client).SetProxyAddress before Connect. See issue #581.
+	if envProxy := viper.GetString("whatsapp_proxy"); envProxy != "" {
+		config.WhatsappProxy = envProxy
 	}
 	if viper.IsSet("whatsapp_presence_pulse_enabled") {
 		config.WhatsappPresencePulseEnabled = viper.GetBool("whatsapp_presence_pulse_enabled")
@@ -208,6 +269,9 @@ func initEnvConfig() {
 	if envChatwootWebhookSecret := viper.GetString("chatwoot_webhook_secret"); envChatwootWebhookSecret != "" {
 		config.ChatwootWebhookSecret = envChatwootWebhookSecret
 	}
+	if envChatwootAllowedHosts := viper.GetString("chatwoot_allowed_hosts"); envChatwootAllowedHosts != "" {
+		config.ChatwootAllowedHosts = splitCommaTrimmed(envChatwootAllowedHosts)
+	}
 	// Chatwoot conversation handling settings
 	if viper.IsSet("chatwoot_reopen_conversation") {
 		config.ChatwootReopenConversation = viper.GetBool("chatwoot_reopen_conversation")
@@ -216,14 +280,7 @@ func initEnvConfig() {
 		config.ChatwootConversationPending = viper.GetBool("chatwoot_conversation_pending")
 	}
 	if envChatwootIgnoreJids := viper.GetString("chatwoot_ignore_jids"); envChatwootIgnoreJids != "" {
-		parts := strings.Split(envChatwootIgnoreJids, ",")
-		jids := make([]string, 0, len(parts))
-		for _, p := range parts {
-			if trimmed := strings.TrimSpace(p); trimmed != "" {
-				jids = append(jids, trimmed)
-			}
-		}
-		config.ChatwootIgnoreJids = jids
+		config.ChatwootIgnoreJids = splitCommaTrimmed(envChatwootIgnoreJids)
 	}
 	// Chatwoot outbound signature settings
 	if viper.IsSet("chatwoot_sign_msg") {
@@ -293,6 +350,56 @@ func initFlags() {
 		config.AppTrustedProxies,
 		`trusted proxy IP ranges for reverse proxy deployments --trusted-proxies <string> | example: --trusted-proxies="0.0.0.0/0" or --trusted-proxies="10.0.0.0/8,172.16.0.0/12"`,
 	)
+	rootCmd.PersistentFlags().StringSliceVarP(
+		&config.AppCORSAllowedOrigins,
+		"cors-allowed-origins", "",
+		config.AppCORSAllowedOrigins,
+		`allowed CORS origins, any origin when empty --cors-allowed-origins <string> | example: --cors-allowed-origins="https://ui.example.com,https://ops.example.com"`,
+	)
+
+	// Web UI flags
+	rootCmd.PersistentFlags().BoolVarP(
+		&config.AppUIEnabled,
+		"ui-enabled", "",
+		config.AppUIEnabled,
+		`serve the gowa-ui dashboard at "/" --ui-enabled <bool>`,
+	)
+	rootCmd.PersistentFlags().BoolVarP(
+		&config.AppUIAutoUpdate,
+		"ui-auto-update", "",
+		config.AppUIAutoUpdate,
+		`download the latest gowa-ui release at startup and periodically --ui-auto-update <bool> | disable for air-gapped deployments with a pre-seeded storages/ui cache`,
+	)
+	rootCmd.PersistentFlags().StringVarP(
+		&config.AppUIRepo,
+		"ui-repo", "",
+		config.AppUIRepo,
+		`GitHub repository the dashboard is downloaded from --ui-repo <string> | example: --ui-repo="aldinokemal/gowa-ui"`,
+	)
+	rootCmd.PersistentFlags().StringVarP(
+		&config.AppUIAssetName,
+		"ui-asset-name", "",
+		config.AppUIAssetName,
+		`release asset name to download --ui-asset-name <string>`,
+	)
+	rootCmd.PersistentFlags().DurationVarP(
+		&config.AppUIUpdateInterval,
+		"ui-update-interval", "",
+		config.AppUIUpdateInterval,
+		`how often to check for a newer dashboard release --ui-update-interval <duration> | example: --ui-update-interval=3h`,
+	)
+	rootCmd.PersistentFlags().StringVarP(
+		&config.AppUIAssetSHA256,
+		"ui-asset-sha256", "",
+		config.AppUIAssetSHA256,
+		`supply-chain pin: only serve the dashboard whose sha256 matches --ui-asset-sha256 <hex> (see the release's .sha256 asset)`,
+	)
+	rootCmd.PersistentFlags().BoolVarP(
+		&config.McpEnabled,
+		"mcp-enabled", "",
+		config.McpEnabled,
+		`serve the MCP endpoint at /mcp --mcp-enabled <bool>`,
+	)
 
 	// Database flags
 	rootCmd.PersistentFlags().StringVarP(
@@ -327,6 +434,12 @@ func initFlags() {
 		config.WhatsappAutoDownloadMedia,
 		`auto download media from incoming messages --auto-download-media <true/false> | example: --auto-download-media=false`,
 	)
+	rootCmd.PersistentFlags().BoolVarP(
+		&config.WhatsappIgnoreStatusMedia,
+		"ignore-status-media", "",
+		config.WhatsappIgnoreStatusMedia,
+		`ignore downloading status media --ignore-status-media <true/false> | example: --ignore-status-media=true`,
+	)
 	rootCmd.PersistentFlags().StringSliceVarP(
 		&config.WhatsappWebhook,
 		"webhook", "w",
@@ -351,6 +464,18 @@ func initFlags() {
 		config.WhatsappWebhookEvents,
 		`whitelist of events to forward to webhook (empty = all events) --webhook-events <string> | example: --webhook-events="message,message.ack,group.participants"`,
 	)
+	rootCmd.PersistentFlags().StringSliceVarP(
+		&config.WhatsappWebhookIgnoreJids,
+		"webhook-ignore-jids", "",
+		config.WhatsappWebhookIgnoreJids,
+		`comma-separated WhatsApp JIDs (or "@g.us"/"@s.whatsapp.net"/"@lid" wildcards) to skip when forwarding to webhooks --webhook-ignore-jids <list> | example: --webhook-ignore-jids="@g.us,628123456789@s.whatsapp.net"`,
+	)
+	rootCmd.PersistentFlags().BoolVarP(
+		&config.WhatsappWebhookDeviceMergeGlobal,
+		"webhook-device-merge-global", "",
+		config.WhatsappWebhookDeviceMergeGlobal,
+		`also deliver a device's events to the global --webhook URLs when that device has its own webhook (default: device webhook replaces the global ones) --webhook-device-merge-global <true/false> | example: --webhook-device-merge-global=true`,
+	)
 	rootCmd.PersistentFlags().BoolVarP(
 		&config.WhatsappAccountValidation,
 		"account-validation", "",
@@ -368,6 +493,12 @@ func initFlags() {
 		"presence-on-connect", "",
 		config.WhatsappPresenceOnConnect,
 		`presence to send on connect: "available", "unavailable", or "none" --presence-on-connect <string> | example: --presence-on-connect="unavailable"`,
+	)
+	rootCmd.PersistentFlags().StringVarP(
+		&config.WhatsappProxy,
+		"whatsapp-proxy", "",
+		config.WhatsappProxy,
+		`outbound proxy for the WhatsApp WebSocket dialer --whatsapp-proxy <string> | example: --whatsapp-proxy="socks5://user:pass@host:1080"`,
 	)
 	rootCmd.PersistentFlags().BoolVarP(
 		&config.WhatsappPresencePulseEnabled,
@@ -455,6 +586,12 @@ func initFlags() {
 		config.ChatwootWebhookSecret,
 		`shared secret required for incoming Chatwoot webhooks --chatwoot-webhook-secret <string> | example: --chatwoot-webhook-secret="super-secret-key"`,
 	)
+	rootCmd.PersistentFlags().StringSliceVarP(
+		&config.ChatwootAllowedHosts,
+		"chatwoot-allowed-hosts", "",
+		config.ChatwootAllowedHosts,
+		`comma-separated allowlist of Chatwoot hosts a per-device config may target (hardens SSRF surface; empty = allow any public host) --chatwoot-allowed-hosts <list> | example: --chatwoot-allowed-hosts="app.chatwoot.com,chat.example.com"`,
+	)
 	rootCmd.PersistentFlags().BoolVarP(
 		&config.ChatwootReopenConversation,
 		"chatwoot-reopen-conversation", "",
@@ -520,8 +657,12 @@ func initChatStorage() (*sql.DB, error) {
 	}
 
 	// Configure connection pool
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	maxConns := config.ChatStorageMaxOpenConns
+	if maxConns < 1 {
+		maxConns = 1
+	}
+	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(maxConns)
 
 	// Test connection
 	if err := db.Ping(); err != nil {
@@ -539,7 +680,7 @@ func initApp() {
 	}
 
 	//preparing folder if not exist
-	err := utils.CreateFolder(config.PathQrCode, config.PathSendItems, config.PathStorages, config.PathMedia)
+	err := utils.CreateFolder(config.PathQrCode, config.PathSendItems, config.PathStorages, config.PathMedia, config.PathUICache)
 	if err != nil {
 		logrus.Errorln(err)
 	}
@@ -571,20 +712,46 @@ func initApp() {
 
 	// Usecase
 	appUsecase = usecase.NewAppService(chatStorageRepo, dm)
+	callUsecase = usecase.NewCallService()
 	chatUsecase = usecase.NewChatService(chatStorageRepo)
-	sendUsecase = usecase.NewSendService(appUsecase, chatStorageRepo)
+	baseSendUsecase := usecase.NewSendService(appUsecase, chatStorageRepo)
+	scheduleService := usecase.NewScheduleService(chatStorageRepo, baseSendUsecase, dm, config.PathStorages)
+	scheduleUsecase = scheduleService
+	sendUsecase = usecase.NewScheduledSendService(baseSendUsecase, scheduleService)
 	userUsecase = usecase.NewUserService(chatStorageRepo)
 	messageUsecase = usecase.NewMessageService(chatStorageRepo)
 	groupUsecase = usecase.NewGroupService()
 	newsletterUsecase = usecase.NewNewsletterService()
-	deviceUsecase = usecase.NewDeviceService(dm)
+	deviceUsecase = usecase.NewDeviceService(dm, appUsecase)
+	scheduleCtx, scheduleCancel := context.WithCancel(context.Background())
+	scheduleService.Start(scheduleCtx)
+	// Stop gives an in-flight scheduled send up to 10s to finish before storage
+	// closes; a send cut off later is recovered as interrupted on next boot.
+	scheduleStop = func() {
+		scheduleCancel()
+		select {
+		case <-scheduleService.Done():
+		case <-time.After(10 * time.Second):
+		}
+	}
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
-func Execute(embedIndex embed.FS, embedViews embed.FS) {
-	EmbedIndex = embedIndex
-	EmbedViews = embedViews
+func Execute() {
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+// splitCommaTrimmed splits a comma-separated env value into trimmed, non-empty
+// entries. Shared by the Chatwoot ignore-jids and allowed-hosts settings.
+func splitCommaTrimmed(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
