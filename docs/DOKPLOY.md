@@ -188,7 +188,7 @@ done
 |---|---|
 | `applicationId` | `Aox0DcLKQEbuvN8_7b83s` |
 | `appName` | `gowa-p3c7ca` |
-| Repo / rama | `HlgCodes/go-whatsapp-web-multidevice` @ `sync/upstream-01Oct2026` |
+| Repo / rama | `HlgCodes/go-whatsapp-web-multidevice` @ `main` |
 | `dockerfile` | `./docker/golang.Dockerfile` |
 | `buildPath` / `dockerContextPath` | `"/"` / `"."` |
 | `githubId` | `Nh_wpxqWEjqWhm-cXlbac` |
